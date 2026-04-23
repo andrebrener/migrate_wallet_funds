@@ -1,25 +1,30 @@
-# trezor-consolidator
+# migrate-wallet-funds
 
 Plan and execute a multi-wallet, multi-chain token consolidation from
-Trezor-controlled EOAs. Built around three steps:
+hardware-wallet-controlled EOAs. Built around three steps:
 
 1. **List** — you provide source wallets and a per-destination USD cap.
 2. **Plan** — an interactive wizard fetches balances, lets you group sources,
    asks how many destinations each group needs, bin-packs tokens into those
    destinations, and writes `transfer_plan.csv`.
-3. **Sign** — a signer iterates the CSV one tx at a time, asks the Trezor
-   to sign each one, broadcasts, waits for confirmation, verifies the
+3. **Sign** — a signer iterates the CSV one tx at a time, asks the hardware
+   wallet to sign each one, broadcasts, waits for confirmation, verifies the
    destination balance changed by the expected amount, and logs everything.
 
 Supported chains: Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Chain.
+
+Supported signers: **Trezor** and **Ledger** — pick via the `SIGNER` env var.
 
 ## Requirements
 
 - Node.js 20+
 - Python 3.9+
 - [Alchemy](https://www.alchemy.com/) API key (free tier works)
-- For the signer: a Trezor Model One (firmware ≥ 1.12 for EIP-1559) and
-  [Trezor Suite](https://trezor.io/trezor-suite) open — it bundles the bridge.
+- One of:
+  - **Trezor** Model One (firmware ≥ 1.12 for EIP-1559) with
+    [Trezor Suite](https://trezor.io/trezor-suite) open — it bundles the bridge.
+  - **Ledger** Nano S/S Plus/X with a recent Ethereum app. Enable blind
+    signing in the Ethereum app settings if the device prompts for it.
 
 ## Setup
 
@@ -41,6 +46,7 @@ Both `.env` and `config.json` are gitignored.
 
 | var                   | meaning                                                                         |
 | --------------------- | ------------------------------------------------------------------------------- |
+| `SIGNER`              | `trezor` (default) or `ledger`.                                                 |
 | `ALCHEMY_API_KEY`     | Alchemy key (required).                                                         |
 | `MAX_USD_PER_WALLET`  | Cap per destination (default `100000`).                                         |
 | `MIN_USD_TO_TRANSFER` | Token balances below this are treated as dust and ignored (default `3`).        |
@@ -59,9 +65,10 @@ You fill in `sources` only. For every wallet you want to consolidate from:
 }
 ```
 
-The `label` is for your eyes; the `trezor` string groups wallets that live on
-the same physical device (the signer uses this to skip sources that aren't on
-the currently-connected device).
+The `label` is for your eyes; the `trezor` string (keep the field name even
+with a Ledger — it's just an ID) groups wallets that live on the same
+physical device. The signer uses this to skip sources that aren't on the
+currently-connected device.
 
 The wizard writes `destinations` and `groups` into this same file after you
 run it — you don't need to write those by hand.
@@ -166,7 +173,9 @@ Committed:
 
 ```
 plan.py               interactive wizard → transfer_plan.csv + config.json
-sign_and_send.js      iterate CSV, sign on Trezor, broadcast, verify
+sign_and_send.js      iterate CSV, sign on hardware wallet, broadcast, verify
+signers/trezor.js     Trezor adapter (used when SIGNER=trezor, default)
+signers/ledger.js     Ledger adapter (used when SIGNER=ledger)
 check_balances.py     diagnostic: token balances across all sources
 check_nfts.py         diagnostic: NFT holdings (rough USD estimate)
 common.py             shared helpers (env, config I/O, Alchemy calls)

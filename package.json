@@ -1,5 +1,5 @@
 {
-  "name": "trezor-consolidator",
+  "name": "migrate-wallet-funds",
   "version": "1.0.0",
   "type": "module",
   "private": true,
@@ -9,6 +9,8 @@
     "only-big": "node sign_and_send.js --skip-under=10000"
   },
   "dependencies": {
+    "@ledgerhq/hw-app-eth": "^6.42.0",
+    "@ledgerhq/hw-transport-node-hid": "^6.29.0",
     "@trezor/connect": "^9.4.2",
     "csv-parse": "^5.5.6",
     "dotenv": "^16.6.1",

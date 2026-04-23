@@ -1,27 +1,28 @@
 #!/usr/bin/env node
 /**
- * Step-by-step token consolidation signer for Trezor Model One.
+ * Step-by-step token consolidation signer. Supports Trezor and Ledger via adapters
+ * in ./signers/*.js — selected by the SIGNER env var (trezor|ledger, default trezor).
  *
- * Reads transfer_plan.csv, derives paths from the connected Trezor, shows each tx for
- * user approval in the terminal, signs on the Trezor device, broadcasts, waits for confirmation.
+ * Reads transfer_plan.csv, derives paths from the connected device, shows each tx for
+ * user approval in the terminal, signs on the device, broadcasts, waits for confirmation.
  *
  * Safety features:
  *   - Verifies destination addresses match config.json (pre-approved config).
  *   - Verifies recovered signature matches expected source address.
  *   - Persists completed tx hashes to execution_state.json (resume on crash/quit).
  *   - Appends every tx to execution_log.ndjson.
- *   - --dry-run: builds and signs but does NOT broadcast (still asks Trezor to confirm).
+ *   - --dry-run: builds the tx but does NOT sign or broadcast.
  *   - --skip-under=N: only process tx with USD value >= N.
  *   - Rows marked [s]kip are persisted in execution_state.json and do NOT reappear on the next run.
  *     Pass --include-skipped to show them again.
  *
  * Prerequisites:
- *   1. Trezor Suite open (it bundles the bridge; standalone Trezor Bridge was deprecated).
- *   2. Trezor Model One connected via USB, unlocked, firmware >= 1.12 (for EIP-1559).
- *   3. npm install (see package.json).
+ *   Trezor: Trezor Suite open (bundles the bridge), device unlocked, firmware ≥ 1.12.
+ *   Ledger: device unlocked, Ethereum app open. Enable blind signing if prompted.
  *
  * Usage:
  *   node sign_and_send.js                    # process all pending
+ *   SIGNER=ledger node sign_and_send.js      # use Ledger instead of Trezor
  *   node sign_and_send.js --skip-under=1000  # only tx >= $1k
  *   node sign_and_send.js --dry-run          # no broadcast
  *   node sign_and_send.js --include-skipped  # re-show rows previously marked skipped
@@ -33,8 +34,21 @@ import { stdin as input, stdout as output } from 'node:process';
 import { parse } from 'csv-parse/sync';
 import { ethers } from 'ethers';
 import 'dotenv/config';
-import TrezorConnectPkg from '@trezor/connect';
-const TrezorConnect = TrezorConnectPkg.default ?? TrezorConnectPkg;
+
+// Holds the active signer so SIGINT / fatal handlers can dispose it cleanly.
+let activeSigner = null;
+
+async function createSigner(type) {
+  if (type === 'ledger') {
+    const { createLedgerSigner } = await import('./signers/ledger.js');
+    return createLedgerSigner();
+  }
+  if (type === 'trezor') {
+    const { createTrezorSigner } = await import('./signers/trezor.js');
+    return createTrezorSigner();
+  }
+  throw new Error(`Unknown SIGNER="${type}". Supported: trezor, ledger.`);
+}
 
 const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
 if (!ALCHEMY_KEY) {
@@ -84,29 +98,6 @@ async function saveJson(path, obj) {
   await fs.writeFile(path, JSON.stringify(obj, null, 2));
 }
 
-async function initTrezor() {
-  await TrezorConnect.init({
-    lazyLoad: false,
-    manifest: { email: 'anonymous@example.com', appUrl: 'http://localhost' },
-  });
-}
-
-async function discoverPaths(sourceAddrs) {
-  // Try both common EVM derivation patterns used by Trezor Suite and MetaMask.
-  const patterns = [];
-  for (let i = 0; i < 20; i++) patterns.push(`m/44'/60'/${i}'/0/0`);
-  for (let i = 0; i < 20; i++) patterns.push(`m/44'/60'/0'/0/${i}`);
-  const bundle = patterns.map(path => ({ path, showOnTrezor: false }));
-  const res = await TrezorConnect.ethereumGetAddress({ bundle });
-  if (!res.success) throw new Error('Trezor getAddress failed: ' + (res.payload?.error || 'unknown'));
-  const found = {};
-  for (const e of res.payload) {
-    const a = e.address.toLowerCase();
-    if (sourceAddrs.includes(a)) found[a] = e.serializedPath;
-  }
-  return found;
-}
-
 async function getTokenDecimals(provider, tokenAddr) {
   const c = new ethers.Contract(tokenAddr, ERC20_IFACE, provider);
   return Number(await c.decimals());
@@ -140,7 +131,7 @@ async function computeSendMaxAmount({ provider, chainCfg, fromAddr, toAddr, buff
   return { amount: bal - reserve, bal, reserve };
 }
 
-async function buildAndSignTx({ trezorPath, provider, chainCfg, fromAddr, toAddr, value, data }) {
+async function buildAndSignTx({ signer, devicePath, provider, chainCfg, fromAddr, toAddr, value, data }) {
   const feeData = await provider.getFeeData();
   const nonce = await provider.getTransactionCount(fromAddr, 'pending');
   let gasLimit;
@@ -151,16 +142,7 @@ async function buildAndSignTx({ trezorPath, provider, chainCfg, fromAddr, toAddr
     throw new Error(`estimateGas failed: ${e.shortMessage || e.message}`);
   }
 
-  const common = {
-    to: toAddr,
-    value: toHex(value),
-    data: data || '0x',
-    chainId: chainCfg.id,
-    nonce: toHex(nonce),
-    gasLimit: toHex(gasLimit),
-  };
-
-  let trezorTx, ethParams, usedFee;
+  let ethParams, usedFee;
   // Use EIP-1559 if the chain supports it and we have a base-fee hint (maxFeePerGas or gasPrice).
   // Priority fee can be missing on L2s like Arbitrum — default to 0.
   // maxFeePerGas = 2x base hint so the tx survives base-fee jumps between fetch and broadcast
@@ -169,7 +151,6 @@ async function buildAndSignTx({ trezorPath, provider, chainCfg, fromAddr, toAddr
   if (chainCfg.eip1559 && baseHint) {
     const maxPrio = feeData.maxPriorityFeePerGas ?? 0n;
     const maxFee = (baseHint * 2n) + maxPrio;
-    trezorTx = { ...common, maxFeePerGas: toHex(maxFee), maxPriorityFeePerGas: toHex(maxPrio) };
     ethParams = {
       type: 2, chainId: chainCfg.id, nonce,
       maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPrio,
@@ -181,7 +162,6 @@ async function buildAndSignTx({ trezorPath, provider, chainCfg, fromAddr, toAddr
     if (!gp) throw new Error('no fee data from RPC (neither EIP-1559 nor legacy gasPrice)');
     // legacy chains (BNB): 30% bump to survive small price moves
     const bumped = (gp * 130n) / 100n;
-    trezorTx = { ...common, gasPrice: toHex(bumped) };
     ethParams = {
       type: 0, chainId: chainCfg.id, nonce,
       gasPrice: bumped, gasLimit, to: toAddr, value, data: data || '0x',
@@ -189,12 +169,11 @@ async function buildAndSignTx({ trezorPath, provider, chainCfg, fromAddr, toAddr
     usedFee = bumped;
   }
 
-  const sig = await TrezorConnect.ethereumSignTransaction({ path: trezorPath, transaction: trezorTx });
-  if (!sig.success) throw new Error('Trezor sign failed: ' + (sig.payload?.error || JSON.stringify(sig.payload)));
+  const sig = await signer.signTx({ path: devicePath, ethParams });
 
   const signedTx = ethers.Transaction.from({
     ...ethParams,
-    signature: { v: Number(sig.payload.v), r: sig.payload.r, s: sig.payload.s },
+    signature: { v: sig.v, r: sig.r, s: sig.s },
   });
 
   if (signedTx.from.toLowerCase() !== fromAddr.toLowerCase()) {
@@ -215,6 +194,7 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   const includeSkipped = args.includes('--include-skipped');
   const skipUnder = Number(args.find(a => a.startsWith('--skip-under='))?.split('=')[1] || 0);
+  const signerType = (process.env.SIGNER || 'trezor').toLowerCase();
 
   const config = await loadJson(CONFIG_PATH);
   const destinations = config.destinations;
@@ -228,7 +208,8 @@ async function main() {
       throw new Error(`CSV destination_address mismatch for ${r.destination}: CSV=${r.destination_address} config=${expected}`);
   }
   console.log(`Loaded ${rows.length} rows from CSV. Destinations verified against config.json ✓`);
-  if (dryRun) console.log('>>> DRY RUN <<<  (signing but NOT broadcasting)');
+  console.log(`Signer: ${signerType}`);
+  if (dryRun) console.log('>>> DRY RUN <<<  (no signing, no broadcast)');
   if (skipUnder) console.log(`Filter: only tx >= ${fmtUsd(skipUnder)}`);
 
   const state = await loadJson(STATE_PATH, { completed: {}, paths: {}, skipped: {} });
@@ -236,32 +217,37 @@ async function main() {
   const skippedCount = Object.keys(state.skipped).length;
   console.log(`Previous state: ${Object.keys(state.completed).length} completed, ${skippedCount} skipped${includeSkipped && skippedCount ? ' (re-showing because --include-skipped)' : ''}.`);
 
+  let signer = null;
   if (!dryRun) {
-    console.log('\nInitializing Trezor Connect... (make sure Trezor Suite is open — it bundles the bridge — and the Trezor is plugged in and unlocked)');
-    await initTrezor();
+    const hint = signerType === 'ledger'
+      ? 'make sure the Ledger is plugged in, unlocked, and the Ethereum app is OPEN'
+      : 'make sure Trezor Suite is open (bundles the bridge) and the Trezor is plugged in and unlocked';
+    console.log(`\nInitializing ${signerType}... (${hint})`);
+    signer = await createSigner(signerType);
+    activeSigner = signer;
 
     const sourceAddrs = [...new Set(rows.map(r => r.source_address.toLowerCase()))];
-    console.log('\nDiscovering derivation paths on the connected Trezor...');
-    const discovered = await discoverPaths(sourceAddrs);
+    console.log(`\nDiscovering derivation paths on the connected ${signer.name}...`);
+    const discovered = await signer.discoverPaths(sourceAddrs);
     for (const [a, p] of Object.entries(discovered)) state.paths[a] = p;
     await saveJson(STATE_PATH, state);
 
     const coveredNow = Object.keys(discovered);
-    console.log(`  this Trezor covers ${coveredNow.length} source wallets:`);
+    console.log(`  this ${signer.name} covers ${coveredNow.length} source wallets:`);
     for (const a of coveredNow) {
       const label = rows.find(r => r.source_address.toLowerCase() === a)?.source_label || '?';
       console.log(`    ${a}  [${discovered[a]}]  ${label}`);
     }
     const notCovered = sourceAddrs.filter(a => !state.paths[a]);
     if (notCovered.length) {
-      console.log(`  missing ${notCovered.length} (on the OTHER Trezor):`);
+      console.log(`  missing ${notCovered.length} (on another device):`);
       for (const a of notCovered) {
         const label = rows.find(r => r.source_address.toLowerCase() === a)?.source_label || '?';
         console.log(`    ${a}  ${label}`);
       }
     }
   } else {
-    console.log('\n[DRY-RUN] no Trezor: showing ALL source wallets from the CSV');
+    console.log('\n[DRY-RUN] no device: showing ALL source wallets from the CSV');
   }
 
   let pending = rows
@@ -290,10 +276,10 @@ async function main() {
   });
 
   const pendingUsd = pending.reduce((s, r) => s + Number(r.amount_usd), 0);
-  console.log(`\n${pending.length} tx pending for this Trezor  (≈ ${fmtUsd(pendingUsd)})`);
-  if (!pending.length) { await TrezorConnect.dispose(); rl.close(); return; }
+  console.log(`\n${pending.length} tx pending for this device  (≈ ${fmtUsd(pendingUsd)})`);
+  if (!pending.length) { await signer?.dispose(); rl.close(); return; }
 
-  if (!(await confirm('\nStart?'))) { await TrezorConnect.dispose(); rl.close(); return; }
+  if (!(await confirm('\nStart?'))) { await signer?.dispose(); rl.close(); return; }
 
   const providers = {};
   const getProvider = (name) => providers[name] || (providers[name] = new ethers.JsonRpcProvider(CHAINS[name].rpc));
@@ -302,7 +288,7 @@ async function main() {
     const chainCfg = CHAINS[row.chain];
     if (!chainCfg) { console.log(`  ! unknown chain ${row.chain}, skip`); continue; }
     const provider = getProvider(row.chain);
-    const trezorPath = state.paths[row.source_address.toLowerCase()] || (dryRun ? '[would derive from Trezor]' : null);
+    const devicePath = state.paths[row.source_address.toLowerCase()] || (dryRun ? '[would derive from device]' : null);
     const fromAddr = row.source_address;
     const isNative = row.token_address === 'NATIVE';
     const noteLower = (row.note || '').toLowerCase();
@@ -359,7 +345,7 @@ async function main() {
     console.log('\n' + '='.repeat(78));
     console.log(`TX [${row.trezor}] ${row.source_label}  —  chain ${row.chain} step ${row.step}`);
     console.log('-'.repeat(78));
-    console.log(`  From:         ${fromAddr}   [${trezorPath}]`);
+    console.log(`  From:         ${fromAddr}   [${devicePath}]`);
     console.log(`  Source bal:   ${srcBalStr} ${row.token_symbol}  ${enough ? '✓ enough' : '✗ INSUFFICIENT'}`);
     console.log(`  Token:        ${row.token_symbol}${isNative ? ' (native)' : `   contract ${row.token_address}`}`);
     console.log(`  Amount:       ${amountStr} ${row.token_symbol}   ≈ ${fmtUsd(usdEst)}`);
@@ -380,7 +366,7 @@ async function main() {
 
     try {
       if (dryRun) {
-        // Simulate without touching the Trezor: estimate gas + fees and print.
+        // Simulate without touching the device: estimate gas + fees and print.
         const feeData = await provider.getFeeData();
         const nonce = await provider.getTransactionCount(fromAddr, 'pending');
         let gasLimitStr = '?';
@@ -409,7 +395,7 @@ async function main() {
         : await getTokenBalance(provider, row.token_address, row.destination_address);
 
       // Retry loop: only re-enters on INSUFFICIENT_FUNDS for send-max native.
-      // Each attempt doubles the gas reserve and re-signs on the Trezor (user confirms again).
+      // Each attempt doubles the gas reserve and re-signs on the device (user confirms again).
       let signed, txResp, receipt;
       const maxAttempts = isRestNative ? 5 : 1;
       let bufferMult = 1;
@@ -423,10 +409,10 @@ async function main() {
             console.log(`  ↻ retry ${attempt}/${maxAttempts}: buffer x${bufferMult} → amount ${amountStr} ${row.token_symbol}  (reserve ${ethers.formatUnits(r.reserve, 18)})`);
           }
           console.log(attempt === 1
-            ? '  → building + asking Trezor for signature (confirm on device)...'
-            : '  → re-sign on Trezor with the new amount...');
+            ? `  → building + asking ${signer.name} for signature (confirm on device)...`
+            : `  → re-sign on ${signer.name} with the new amount...`);
           signed = await buildAndSignTx({
-            trezorPath, provider, chainCfg, fromAddr, toAddr, value: isNative ? amount : 0n, data,
+            signer, devicePath, provider, chainCfg, fromAddr, toAddr, value: isNative ? amount : 0n, data,
           });
           console.log(`    signed. pre-broadcast hash: ${signed.hash}`);
 
@@ -494,20 +480,20 @@ async function main() {
   }
 
   console.log(`\nDone. Total completed so far: ${Object.keys(state.completed).length}`);
-  if (!dryRun) await TrezorConnect.dispose();
+  await signer?.dispose();
   rl.close();
 }
 
 process.on('SIGINT', async () => {
-  console.log('\n\nInterrupted — closing Trezor Connect and exiting...');
-  try { await TrezorConnect.dispose(); } catch {}
+  console.log('\n\nInterrupted — closing device connection and exiting...');
+  try { await activeSigner?.dispose(); } catch {}
   rl.close();
   process.exit(130);
 });
 
 main().catch(async (e) => {
   console.error('\nFATAL:', e.stack || e.message);
-  try { await TrezorConnect.dispose(); } catch {}
+  try { await activeSigner?.dispose(); } catch {}
   rl.close();
   process.exit(1);
 });
