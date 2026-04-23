@@ -1,0 +1,17 @@
+{
+  "name": "trezor-consolidator",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "execute": "node sign_and_send.js",
+    "dry-run": "node sign_and_send.js --dry-run",
+    "only-big": "node sign_and_send.js --skip-under=10000"
+  },
+  "dependencies": {
+    "@trezor/connect": "^9.4.2",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.13.4"
+  }
+}

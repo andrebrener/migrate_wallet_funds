@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+
+.env
+config.json
+
+execution_state.json
+execution_log.ndjson
+transfer_plan.csv
+*.log

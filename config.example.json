@@ -1,0 +1,18 @@
+{
+  "_comment": "Fill in 'sources' — every wallet you want to consolidate FROM. Each source needs a human label and the Trezor device that holds it. Run plan.py; the wizard writes 'destinations' and 'groups' here.",
+
+  "sources": {
+    "0x0000000000000000000000000000000000000001": {
+      "label": "Hot wallet",
+      "trezor": "TrezorA"
+    },
+    "0x0000000000000000000000000000000000000002": {
+      "label": "DeFi wallet",
+      "trezor": "TrezorA"
+    },
+    "0x0000000000000000000000000000000000000003": {
+      "label": "Cold storage",
+      "trezor": "TrezorB"
+    }
+  }
+}
